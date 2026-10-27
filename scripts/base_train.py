@@ -53,6 +53,7 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
+parser.add_argument("--time-budget-s", type=float, default=-1, help="train until this much training time has passed, with the schedules following elapsed time; the horizon below then only sets batch size and weight decay (-1 = disable)")
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
@@ -355,35 +356,45 @@ total_tokens = total_batch_size * num_iterations # the actual number of tokens w
 print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+if args.time_budget_s > 0:
+    print0(f"Training for a time budget of {args.time_budget_s:,.0f}s instead; schedules treat it as {num_iterations:,} iterations")
+
+# Where the schedules are: the step, or with a time budget, the elapsed share of the budget in iterations
+def schedule_position(it):
+    if args.time_budget_s > 0:
+        return num_iterations * min(total_training_time / args.time_budget_s, 1.0)
+    return it
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
     warmup_iters = args.warmup_steps
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
+    t = schedule_position(it)
     if it < warmup_iters:
         return (it + 1) / warmup_iters
-    elif it <= num_iterations - warmdown_iters:
+    elif t <= num_iterations - warmdown_iters:
         return 1.0
     else:
-        progress = (num_iterations - it) / warmdown_iters
+        progress = (num_iterations - t) / warmdown_iters
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
 
 # Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
 def get_muon_momentum(it):
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
     warmdown_start = num_iterations - warmdown_iters
+    t = schedule_position(it)
     if it < 400:
         frac = it / 400
         return (1 - frac) * 0.85 + frac * 0.97
-    elif it >= warmdown_start:
-        progress = (it - warmdown_start) / warmdown_iters
+    elif t >= warmdown_start:
+        progress = (t - warmdown_start) / warmdown_iters
         return 0.97 * (1 - progress) + 0.90 * progress
     else:
         return 0.97
 
 # Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
 def get_weight_decay(it):
-    return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
+    return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * schedule_position(it) / num_iterations))
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -415,6 +426,8 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
+    if args.time_budget_s > 0:
+        last_step = total_training_time >= args.time_budget_s
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
@@ -542,13 +555,18 @@ while True:
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+    if args.time_budget_s > 0 and ddp:
+        # each rank times its own step: use rank 0's so all ranks agree on when the budget runs out
+        dt_tensor = torch.tensor(dt, device=device)
+        dist.broadcast(dt_tensor, 0)
+        dt = dt_tensor.item()
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
-    pct_done = 100 * step / num_iterations
+    pct_done = 100 * schedule_position(step) / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
@@ -556,7 +574,9 @@ while True:
         total_training_time += dt # only count the time after the first 10 steps
     # Calculate ETA based on average time per step (excluding first 10 steps)
     steps_done = step - 10
-    if steps_done > 0:
+    if args.time_budget_s > 0:
+        eta_str = f" | eta: {max(args.time_budget_s - total_training_time, 0)/60:.1f}m"
+    elif steps_done > 0:
         avg_time_per_step = total_training_time / steps_done
         remaining_steps = num_iterations - step
         eta_seconds = remaining_steps * avg_time_per_step
